@@ -5,3 +5,4 @@ pymupdf
 gradio
 torch
 requests
+python
