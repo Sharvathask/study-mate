@@ -11,7 +11,8 @@ from functools import lru_cache
 
 # ================== CONFIG ==================
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
-FALLBACK_MODEL = "google/flan-t5-small"
+# Using IBM Granite model for text generation
+GRANITE_MODEL = "ibm-granite/granite-3b-code-instruct"  # IBM Granite model
 CHUNK_SIZE, CHUNK_OVERLAP, TOP_K = 800, 200, 5
 
 # ================== HELPERS ==================
@@ -47,17 +48,26 @@ def build_faiss(embs):
     idx.add(embs)
     return idx
 
-def try_load_pipe():
+def try_load_granite():
     try:
         device = 0 if torch.cuda.is_available() else -1
-        pipe = pipeline("text2text-generation", model=FALLBACK_MODEL, device=device)
-        print("Loaded generator:", FALLBACK_MODEL)
+        # Try loading IBM Granite model first
+        pipe = pipeline("text-generation", model=GRANITE_MODEL, device=device, 
+                       trust_remote_code=True, torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32)
+        print("Loaded IBM Granite model:", GRANITE_MODEL)
         return pipe
     except Exception as e:
-        print("Generator load failed:", e)
-        return None
+        print("Granite model load failed, trying fallback:", e)
+        try:
+            # Fallback to FLAN-T5 if Granite fails
+            fallback_pipe = pipeline("text2text-generation", model="google/flan-t5-small", device=device)
+            print("Loaded fallback model: google/flan-t5-small")
+            return fallback_pipe
+        except Exception as e2:
+            print("All models failed to load:", e2)
+            return None
 
-GEN_PIPE = try_load_pipe()
+GEN_PIPE = try_load_granite()
 
 # ================== STATE ==================
 STATE = {"chunks": [], "index": None, "answers": [], "quiz": [], "topics": []}
@@ -91,27 +101,42 @@ def build_prompt(q, chunks, marks=None):
         style = "Give a brief structured answer with example."
     elif marks == 16:
         style = "Give detailed answer with example and explanation."
-    return f"""You are StudyMate, an expert teacher.
-Use the context strictly to write a complete, clear answer.
+    
+    # Enhanced prompt for Granite model
+    return f"""You are StudyMate, an expert AI teacher powered by IBM Granite.
+Use the provided context strictly to write a complete, clear, and accurate answer.
 
 Question: {q}
-Marks: {marks}
-Style: {style}
+Required Marks: {marks}
+Answer Style: {style}
 
-Context:
+Context from Documents:
 {context}
 
-Answer in full sentences:"""
+Instructions: Provide a comprehensive answer based only on the context above. Be precise, educational, and structure your response clearly."""
 
 def generate_answer(prompt):
     if GEN_PIPE:
         try:
-            out = GEN_PIPE(prompt, max_new_tokens=400)
-            if isinstance(out, list):
-                return out[0].get("generated_text") or out[0].get("text") or str(out[0])
+            # Check if it's Granite (text-generation) or FLAN-T5 (text2text-generation)
+            if "granite" in GRANITE_MODEL.lower():
+                # For Granite model
+                out = GEN_PIPE(prompt, max_new_tokens=500, do_sample=True, temperature=0.7, 
+                             pad_token_id=GEN_PIPE.tokenizer.eos_token_id)
+                if isinstance(out, list) and len(out) > 0:
+                    generated = out[0].get("generated_text", "")
+                    # Remove the original prompt from the generated text
+                    if prompt in generated:
+                        return generated.replace(prompt, "").strip()
+                    return generated
+            else:
+                # For FLAN-T5 fallback
+                out = GEN_PIPE(prompt, max_new_tokens=400)
+                if isinstance(out, list):
+                    return out[0].get("generated_text") or out[0].get("text") or str(out[0])
         except Exception as e:
             print("Pipeline error:", e)
-    return "⚠ No generator available."
+    return "⚠ No generator available. Please check model loading."
 
 def ask_question(q, marks):
     if STATE["index"] is None:
@@ -144,7 +169,8 @@ def tracker():
     return {
         "Topics Discussed": STATE["topics"],
         "Quiz Questions": STATE["quiz"],
-        "Answers Saved": len(STATE["answers"])
+        "Answers Saved": len(STATE["answers"]),
+        "AI Model": GRANITE_MODEL if "granite" in str(GEN_PIPE) else "Fallback Model"
     }
 
 def get_saved_answers():
@@ -157,18 +183,19 @@ def get_saved_answers():
 
 # ================== GRADIO UI ==================
 with gr.Blocks() as demo:
-    gr.Markdown("# 📘 StudyMate — Full Answer Version")
+    gr.Markdown("# 📘 StudyMate — Powered by IBM Granite AI")
+    gr.Markdown("*Advanced AI-powered study assistant using IBM Granite models for superior text generation*")
 
     with gr.Tab("Index PDFs"):  
         pdfs = gr.File(file_types=[".pdf"], file_count="multiple", type="filepath")  
-        idx_btn = gr.Button("Index")  
+        idx_btn = gr.Button("Index PDFs")  
         idx_out = gr.Textbox()  
         idx_btn.click(index_pdfs, pdfs, idx_out)  
 
     with gr.Tab("Q&A"):  
-        q = gr.Textbox(label="Ask Question")  
+        q = gr.Textbox(label="Ask Question", placeholder="Enter your study question here...")  
         marks = gr.Radio([2,3,8,16], label="Marks", value=2)  
-        go = gr.Button("Get Answer")  
+        go = gr.Button("Get Answer (Granite AI)")  
         ans = gr.Markdown(label="Answer")  
         ctx = gr.Textbox(label="Context", lines=6)  
 
@@ -193,5 +220,5 @@ with gr.Blocks() as demo:
         track_out = gr.JSON()  
         track_btn.click(tracker, outputs=track_out)  
 
-print("Launching Gradio... (share=True gives public link)")
+print("Launching StudyMate with IBM Granite AI... (share=True gives public link)")
 demo.launch(share=True)
