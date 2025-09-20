@@ -1,7 +1,7 @@
 # ================== INSTALL ==================
-# !pip install -q transformers sentence-transformers faiss-cpu pymupdf gradio torch requests
+!pip install -q transformers sentence-transformers faiss-cpu pymupdf gradio torch requests graphviz
 
-import os, traceback, torch, fitz, re, random
+import os, traceback, requests, torch, fitz, json
 import numpy as np
 import gradio as gr
 import faiss
@@ -50,7 +50,9 @@ def build_faiss(embs):
 def try_load_pipe():
     try:
         device = 0 if torch.cuda.is_available() else -1
-        return pipeline("text2text-generation", model=FALLBACK_MODEL, device=device)
+        pipe = pipeline("text2text-generation", model=FALLBACK_MODEL, device=device)
+        print("Loaded generator:", FALLBACK_MODEL)
+        return pipe
     except Exception as e:
         print("Generator load failed:", e)
         return None
@@ -80,40 +82,33 @@ def index_pdfs(files):
 
 def build_prompt(q, chunks, marks=None):
     context = "\n\n".join(chunks)
-
+    style = ""
     if marks == 2:
-        style = "Write only 3–4 concise bullet points."
-        max_len = 80
+        style = "Give only formula + 2 short sentences."
     elif marks == 3:
-        style = "Write exactly 5–6 bullet points."
-        max_len = 120
+        style = "Give formula + 5-6 key points."
     elif marks == 8:
-        style = "Write 10–12 detailed bullet points."
-        max_len = 250
+        style = "Give a brief structured answer with example."
     elif marks == 16:
-        return context, 0  
-
+        style = "Give detailed answer with example and explanation."
     return f"""You are StudyMate, an expert teacher.
-Strictly follow the marks scheme.
+Use the context strictly to write a complete, clear answer.
 
 Question: {q}
 Marks: {marks}
-Instruction: {style}
+Style: {style}
 
 Context:
 {context}
 
-Answer as bullet points:""", max_len
+Answer in full sentences:"""
 
-def generate_answer(prompt, max_len):
-    if max_len == 0:   # 16 marks → return full context
-        return prompt
+def generate_answer(prompt):
     if GEN_PIPE:
         try:
-            out = GEN_PIPE(prompt, max_new_tokens=max_len)
+            out = GEN_PIPE(prompt, max_new_tokens=400)
             if isinstance(out, list):
-                text = out[0].get("generated_text") or out[0].get("text") or str(out[0])
-                return text.strip()
+                return out[0].get("generated_text") or out[0].get("text") or str(out[0])
         except Exception as e:
             print("Pipeline error:", e)
     return "⚠ No generator available."
@@ -127,9 +122,9 @@ def ask_question(q, marks):
     retrieved = [STATE["chunks"][i] for i in idxs] if idxs else []
     if not retrieved:
         return "No relevant context found.", ""
-    prompt, max_len = build_prompt(q, retrieved, marks)
-    ans = generate_answer(prompt, max_len)
-    return ans, ans
+    prompt = build_prompt(q, retrieved, marks)
+    ans = generate_answer(prompt)
+    return ans, "\n\n".join(retrieved)
 
 def save_answer(q, ans, marks):
     if not ans.strip():
@@ -138,44 +133,12 @@ def save_answer(q, ans, marks):
     STATE["topics"].append(q)
     return "✅ Answer saved!"
 
-# --------- QUIZ (MCQs) -----------
-def generate_mcq_from_context(context, n=3):
-    """Generate n MCQs from context text."""
-    if not GEN_PIPE:
-        return ["⚠ Generator not available."]
-    prompt = f"""
-You are StudyMate. Create {n} multiple-choice questions (MCQs) from the following context.
-Each question must have:
-- A clear question
-- Four complete options: A, B, C, D
-- The correct answer clearly labeled as "Answer: <option letter>"
-Ensure all words and sentences are fully complete.
-
-Context:
-{context}
-
-MCQs:
-"""
-    try:
-        out = GEN_PIPE(prompt, max_new_tokens=400)
-        if isinstance(out, list):
-            text = out[0].get("generated_text") or out[0].get("text") or str(out[0])
-            return text.strip().split("\n\n")
-    except Exception as e:
-        print("MCQ generation error:", e)
-    return ["⚠ Could not generate MCQs."]
-
 def conduct_quiz():
     if not STATE["chunks"]:
-        return "❌ Index PDFs first!"
-    # Use first few chunks for quiz
-    selected = STATE["chunks"][:2]
-    quiz_qs = []
-    for chunk in selected:
-        mcqs = generate_mcq_from_context(chunk, n=2)
-        quiz_qs.extend(mcqs)
-    STATE["quiz"] = quiz_qs
-    return "\n\n".join(quiz_qs)
+        return "Index PDFs first!"
+    qs = ["Q"+str(i+1)+": "+STATE["chunks"][i][:80] for i in range(min(5,len(STATE["chunks"])))]
+    STATE["quiz"] = qs
+    return "\n".join(qs)
 
 def tracker():
     return {
@@ -194,7 +157,7 @@ def get_saved_answers():
 
 # ================== GRADIO UI ==================
 with gr.Blocks() as demo:
-    gr.Markdown("# 📘 StudyMate — Marks-based Bullet Point Answers + MCQ Quiz")
+    gr.Markdown("# 📘 StudyMate — Full Answer Version")
 
     with gr.Tab("Index PDFs"):  
         pdfs = gr.File(file_types=[".pdf"], file_count="multiple", type="filepath")  
@@ -207,7 +170,7 @@ with gr.Blocks() as demo:
         marks = gr.Radio([2,3,8,16], label="Marks", value=2)  
         go = gr.Button("Get Answer")  
         ans = gr.Markdown(label="Answer")  
-        ctx = gr.Textbox(label="Context (Answer will appear here)", lines=12)  
+        ctx = gr.Textbox(label="Context", lines=6)  
 
         save_btn = gr.Button("💾 Save This Answer")  
         save_status = gr.Textbox(label="Save Status")  
@@ -216,8 +179,8 @@ with gr.Blocks() as demo:
         save_btn.click(save_answer, [q, ans, marks], save_status)
 
     with gr.Tab("Quiz"):  
-        quiz_btn = gr.Button("Generate MCQ Quiz")  
-        quiz_out = gr.Textbox(lines=15)  
+        quiz_btn = gr.Button("Conduct Quiz (5 Qs)")  
+        quiz_out = gr.Textbox(lines=8)  
         quiz_btn.click(conduct_quiz, outputs=quiz_out)  
 
     with gr.Tab("Saved Answers"):  
